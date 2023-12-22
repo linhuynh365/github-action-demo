@@ -1,0 +1,210 @@
+name: _reusable_infra_create
+
+on:
+  workflow_call:
+    inputs:
+      TERRAFORM_RESOURCE_DEFINITION_DIRECTORY:
+        required: true
+        type: string
+      TERRAFORM_IMPLEMENTATION_DIRECTORY:
+        required: false
+        type: string
+        default: 'default'
+      TERRAFORM_VERSION:
+        required: false
+        type: string
+        default: '1.4.6'
+      MODULE_REPOSITORY:
+        required: false
+        type: string
+        default: 'taa-dev-enablement/dep-iac-templates'
+      MODULE_VERSION:
+        required: true
+        type: string
+      TEMPLATE_DIRECTORY:
+        required: false
+        type: string
+        default: 'template'
+      RESOURCE_TYPE:
+        required: true
+        type: string
+        description: Choose 'app' if deploying app infrastructure. Choose 'suite' if deploying suite infrastructure
+      NAME:
+        required: true
+        type: string
+    secrets:
+      TF_VAR_DEP_TERRAFORM_REMOTE_STATE_CLIENT_SECRET:
+        required: true
+      WK_TAA_DEVELOPER_PLATFORM_AZURE_CONNECTION:
+        required: true
+      DEP_GITHUB_APP_ID:
+        required: true
+      DEP_GITHUB_APP_PVT:
+        required: true
+
+# Special permissions required for OIDC authentication
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+
+  # Set the secret to be used by TF remote state access/update.
+  ARM_CLIENT_SECRET: ${{ secrets.TF_VAR_DEP_TERRAFORM_REMOTE_STATE_CLIENT_SECRET }}
+  
+  # Allow command execution required to setup ssh private key.
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+
+jobs:
+  input_validation:
+    name: Variable Validation
+    runs-on: ubuntu-latest
+    steps:
+    # Checkout the repository to the GitHub Actions runner
+    - name: Checkout
+      uses: actions/checkout@v3
+    
+    - name: Validation Resource Type
+      if: ${{ inputs.RESOURCE_TYPE }} != 'app' && ${{ inputs.RESOURCE_TYPE }} != 'suite'
+      run: echo "::error Invalid RESOURCE_TYPE. Available options are 'app' and 'suite'"
+
+  process_env:
+    name: Process input variables
+    needs: [input_validation]
+    runs-on: ubuntu-latest
+    outputs:
+      TERRAFORM_IMPLEMENTATION_DIRECTORY: ${{ steps.terraform-implementation-directory.outputs.TERRAFORM_IMPLEMENTATION_DIRECTORY }}
+      INFRA_NAME: ${{ steps.terraform-implementation-directory.outputs.INFRA_NAME }}
+    steps:
+      - id: terraform-implementation-directory
+        if: ${{ inputs.TERRAFORM_IMPLEMENTATION_DIRECTORY }} == 'default'
+        run: echo "TERRAFORM_IMPLEMENTATION_DIRECTORY=template/resources/${{ inputs.RESOURCE_TYPE }}_resource_template/" >> $GITHUB_OUTPUT
+      - id: process-terraform-directory-name
+        run: echo "INFRA_NAME=$(echo ${{ steps.terraform-implementation-directory.outputs.TERRAFORM_IMPLEMENTATION_DIRECTORY }} | tr '/' '_')" >> $GITHUB_OUTPUT
+
+  create_infrastructure:
+    name: Create infrastructure
+    needs: [process_env]
+    runs-on: ubuntu-latest
+    env:
+      #this is needed since we are running terraform with read-only permissions
+      ARM_SKIP_PROVIDER_REGISTRATION: true
+      ACTIONS_STEP_DEBUG: true
+  
+    steps:
+        - name: Checkout
+          uses: actions/checkout@v3
+
+        - name: Login to Azure Subscription where the resources should be created.
+          uses: azure/login@v1
+          with:
+            creds: ${{ secrets.WK_TAA_DEVELOPER_PLATFORM_AZURE_CONNECTION }}
+  
+        - name: my-app-install token
+          id: github-app
+          uses: getsentry/action-github-app-token@v2
+          with:
+            app_id: ${{ secrets.DEP_GITHUB_APP_ID }}
+            private_key: ${{ secrets.DEP_GITHUB_APP_PVT }}
+  
+        - name: Configure Github App Key
+          id: set_github_token
+          shell: bash
+          run: |
+            git config --add --global url."https://oauth2:$GITHUB_TOKEN@github.com/".insteadOf "https://github.com/"
+          env:
+            GITHUB_TOKEN: ${{ steps.github-app.outputs.token }}
+  
+        - name: Checkout platform templates
+          uses: actions/checkout@v3
+          with:
+            repository: ${{ inputs.MODULE_REPOSITORY }}
+            path: ${{ inputs.TEMPLATE_DIRECTORY }}
+            token: ${{ steps.github-app.outputs.token }}
+            ref: ${{ inputs.MODULE_VERSION }}
+
+        - name: Setup Terraform
+          uses: hashicorp/setup-terraform@v2
+          with:
+            terraform_version: ${{ inputs.TERRAFORM_VERSION }}
+            terraform_wrapper: false
+
+        - name: Initialize Terraform
+          id: init
+          working-directory: ${{ needs.process_env.outputs.TERRAFORM_IMPLEMENTATION_DIRECTORY }}
+          run: terraform init -backend-config=${{ github.workspace }}/${{ inputs.TERRAFORM_RESOURCE_DEFINITION_DIRECTORY }}/backend.conf
+
+        - name: Terraform Validate
+          id: validate
+          working-directory: ${{ needs.process_env.outputs.TERRAFORM_IMPLEMENTATION_DIRECTORY }}
+          run: terraform validate
+          continue-on-error: false
+
+        - name: Terraform Format
+          id: format
+          working-directory: ${{ needs.process_env.outputs.TERRAFORM_IMPLEMENTATION_DIRECTORY }}
+          run: terraform fmt -check
+          continue-on-error: false
+
+        - name: Terraform Plan
+          id: plan
+          working-directory: ${{ needs.process_env.outputs.TERRAFORM_IMPLEMENTATION_DIRECTORY }}
+          shell: bash
+          run: |
+            export exitcode=0
+            terraform plan -detailed-exitcode -no-color -out tfplan -lock=false -var-file=${{ github.workspace }}/${{ inputs.TERRAFORM_RESOURCE_DEFINITION_DIRECTORY }}/terraform.tfvars || export exitcode=$?
+            echo "exitcode=$exitcode" >> $GITHUB_OUTPUT
+            if [ $exitcode -eq 1 ]; then
+            echo Terraform Plan Failed!
+            exit 1
+            else
+            exit 0
+            fi
+
+        - name: Create String Output
+          if: github.event_name == 'pull_request'
+          id: tf-plan-string
+          working-directory: ${{ needs.process_env.outputs.TERRAFORM_IMPLEMENTATION_DIRECTORY }}
+          run: |
+            TERRAFORM_PLAN=$(terraform show -no-color tfplan)
+
+            delimiter="$(openssl rand -hex 8)"
+            echo "summary<<${delimiter}" >> $GITHUB_OUTPUT
+            echo "## ${{ inputs.RESOURCE_TYPE }}_${{ needs.process_env.outputs.INFRA_NAME }} Terraform Plan Output" >> $GITHUB_OUTPUT
+            echo "<details><summary>Click to expand</summary>" >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_OUTPUT
+            echo '```terraform' >> $GITHUB_OUTPUT
+            echo "$TERRAFORM_PLAN" >> $GITHUB_OUTPUT
+            echo '```' >> $GITHUB_OUTPUT
+            echo "</details>" >> $GITHUB_OUTPUT
+            echo "${delimiter}" >> $GITHUB_OUTPUT
+
+        - name: Publish Terraform Plan to Task Summary
+          if: github.event_name == 'pull_request'
+          env:
+            SUMMARY: ${{ steps.tf-plan-string.outputs.summary }}
+          run: |
+            echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
+
+        - name: Push Terraform Output to PR
+          if: github.event_name == 'pull_request'
+          uses: actions/github-script@v6
+          env:
+            SUMMARY: "${{ steps.tf-plan-string.outputs.summary }}"
+          with:
+            github-token: ${{ secrets.GITHUB_TOKEN }}
+            script: |
+              const body = `${process.env.SUMMARY}`;
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+              })
+
+        - name: Terraform Apply
+          id: apply
+          if: github.ref == 'refs/heads/main' && steps.plan.outputs.exitcode == 2
+          working-directory: ${{ needs.process_env.outputs.TERRAFORM_IMPLEMENTATION_DIRECTORY }}
+          run: terraform apply -auto-approve tfplan
